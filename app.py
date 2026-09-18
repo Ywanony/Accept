@@ -61,14 +61,14 @@ from pyrogram.types import (
 # ============================================================
 
 
-BOT_TOKEN = "8790200190:AAHYwniqFPMhI42TByYNkgDZgbhwEepoOKA"
+BOT_TOKEN = "8863012125:AAHo7PiKIsieNTIY1DVTieiKxncchCwjlPE"
 
-API_ID = 38410382
-API_HASH = "2601d5fe89f068423003e552a7ac1d79"
+API_ID = 34705987
+API_HASH = "67227b093122bddb70c6dbb354ab46c1"
 
-BOT_SESSION = "AutoReqxAcceptxBot"
+BOT_SESSION = "Xaceptedgbot"
 
-OWNER_ID = 6594401737
+OWNER_ID = 8506898445
 
 
 # ============================================================
