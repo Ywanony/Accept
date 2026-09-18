@@ -57,11 +57,9 @@ from pyrogram.types import (
 )
 
 # ============================================================
-# CONFIG  (all secrets come from environment variables)
-# ============================================================
-# ============================================================
 # TELEGRAM BOT
 # ============================================================
+
 
 BOT_TOKEN = "8790200190:AAHYwniqFPMhI42TByYNkgDZgbhwEepoOKA"
 
@@ -81,7 +79,6 @@ SUPABASE_URL = "https://hrdmhwuckazrcttwswlp.supabase.co"
 
 # Supabase Dashboard → Project Settings → API → API Keys
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhyZG1od3Vja2F6cmN0dHdzd2xwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4OTcwMjYyMSwiZXhwIjoyMTA1Mjc4NjIxfQ.NyzQb35WtoL4Y2co6L0Gw94xHexWcwoN3uREaEBFOeg"
-
 
 # ============================================================
 # DATABASE SETTINGS
@@ -123,9 +120,9 @@ REQUEST_CACHE_TTL = 600
 # PENDING VERIFICATION
 # ============================================================
 
-# True = bot restart hone ke baad pending users ko
-# verification button dobara send karega.
-# False = dobara send nahi karega.
+# True  = restart ke baad pending users ko verification button
+#         dobara bhejega.
+# False = dobara nahi bhejega.
 
 RESEND_PENDING_ON_START = False
 
@@ -136,10 +133,24 @@ RESEND_LIMIT = 100
 # CLEANUP
 # ============================================================
 
-# Har 3600 seconds (1 hour) stale verification rows cleanup
-# honge.
+# Har 3600 seconds (1 hour) me stale verification rows cleanup.
 
 CLEANUP_INTERVAL = 3600
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+# Users fetched per page from the database.
+BROADCAST_PAGE_SIZE = 500
+
+# Messages per second. Telegram tolerates ~30/s to different
+# users; 20 keeps a safety margin and avoids long FloodWaits.
+BROADCAST_RATE = 20
+
+# Progress message is edited every N users.
+BROADCAST_PROGRESS_EVERY = 50
 
 
 # ============================================================
@@ -193,6 +204,10 @@ request_lock = None
 
 processing_requests = {}
 background_tasks = set()
+
+# Only one broadcast may run at a time.
+broadcast_running = False
+broadcast_cancel = False
 
 
 # ============================================================
@@ -568,6 +583,48 @@ class SupabaseDB:
         )
 
     # --------------------------------------------------------
+    # BROADCAST
+    # --------------------------------------------------------
+
+    async def get_broadcast_users(self, limit=500, after_id=0):
+        """
+        Keyset pagination over users who have not blocked the bot.
+        Returns a list of user ids (ascending).
+        """
+        result = await self.rpc(
+            "bot_broadcast_users",
+            {"p_limit": int(limit), "p_after_id": int(after_id)},
+        )
+        return result if isinstance(result, list) else []
+
+    async def create_broadcast(self, owner_id, kind, preview=None):
+        result = await self.rpc(
+            "bot_create_broadcast",
+            {
+                "p_owner_id": int(owner_id),
+                "p_kind": kind,
+                "p_preview": (preview or "")[:300] or None,
+            },
+        )
+        return result if isinstance(result, int) else None
+
+    async def update_broadcast(
+        self, broadcast_id, sent=0, failed=0, blocked=0, status=None
+    ):
+        if not broadcast_id:
+            return None
+        return await self.rpc(
+            "bot_update_broadcast",
+            {
+                "p_id": int(broadcast_id),
+                "p_sent": int(sent),
+                "p_failed": int(failed),
+                "p_blocked": int(blocked),
+                "p_status": status,
+            },
+        )
+
+    # --------------------------------------------------------
     # STATS
     # --------------------------------------------------------
 
@@ -760,6 +817,9 @@ def help_text():
         "`/id` — Chat information\n"
         "`/status` — Permission check\n"
         "`/stats` — Chat statistics\n\n"
+        "### 👑 Owner only\n\n"
+        "`/broadcast` — Reply to a message, or `/broadcast <text>`\n"
+        "`/cancelbroadcast` — Stop a running broadcast\n\n"
         "⚡ Multiple requests are processed concurrently."
     )
 
@@ -1554,6 +1614,263 @@ async def verify_callback(client, callback):
 
 
 # ============================================================
+# BROADCAST  (owner only)
+# ============================================================
+#
+#   /broadcast <text>        -> sends that text
+#   /broadcast  (as a reply) -> forwards a copy of the replied
+#                               message, buttons and media
+#                               included
+#   /cancelbroadcast         -> stops a running broadcast
+#
+# Users who have blocked the bot are flagged in the database
+# and skipped on the next run.
+# ============================================================
+
+async def broadcast_worker(source, status_message, text=None):
+
+    global broadcast_running, broadcast_cancel
+
+    sent = 0
+    failed = 0
+    blocked = 0
+    total = 0
+
+    after_id = 0
+    delay = 1 / max(BROADCAST_RATE, 1)
+
+    broadcast_id = await db.create_broadcast(
+        OWNER_ID,
+        "text" if text else "copy",
+        text or (source.text or source.caption or "media"),
+    )
+
+    started = time.monotonic()
+
+    try:
+
+        while True:
+
+            user_ids = await db.get_broadcast_users(
+                limit=BROADCAST_PAGE_SIZE, after_id=after_id
+            )
+
+            if not user_ids:
+                break
+
+            after_id = user_ids[-1]
+
+            for user_id in user_ids:
+
+                if broadcast_cancel:
+                    log.warning("BROADCAST CANCELLED BY OWNER")
+                    raise asyncio.CancelledError
+
+                total += 1
+
+                try:
+
+                    if text:
+                        await app.send_message(
+                            user_id,
+                            text,
+                            disable_web_page_preview=True,
+                        )
+                    else:
+                        await source.copy(user_id)
+
+                    sent += 1
+
+                except FloodWait as e:
+
+                    seconds = int(getattr(e, "value", 1))
+
+                    log.warning(
+                        "BROADCAST FLOODWAIT | %s seconds", seconds
+                    )
+
+                    await asyncio.sleep(seconds)
+
+                    # retry this user once after the wait
+                    try:
+                        if text:
+                            await app.send_message(
+                                user_id,
+                                text,
+                                disable_web_page_preview=True,
+                            )
+                        else:
+                            await source.copy(user_id)
+                        sent += 1
+                    except Exception:
+                        failed += 1
+
+                except (
+                    UserIsBlocked,
+                    PeerIdInvalid,
+                    InputUserDeactivated,
+                    UserDeactivated,
+                ):
+                    blocked += 1
+                    fire(
+                        db.mark_dm_blocked(user_id, True),
+                        f"db-block-{user_id}",
+                    )
+
+                except asyncio.CancelledError:
+                    raise
+
+                except Exception as e:
+                    failed += 1
+                    log.warning(
+                        "BROADCAST SEND FAILED | User=%s | %s", user_id, e
+                    )
+
+                if total % BROADCAST_PROGRESS_EVERY == 0:
+
+                    fire(
+                        db.update_broadcast(
+                            broadcast_id, sent, failed, blocked, "running"
+                        ),
+                        f"db-bc-{broadcast_id}",
+                    )
+
+                    with suppress(Exception):
+                        await status_message.edit_text(
+                            "📢 **Broadcasting...**\n\n"
+                            f"👥 Processed: `{total}`\n"
+                            f"✅ Sent: `{sent}`\n"
+                            f"🚫 Blocked: `{blocked}`\n"
+                            f"❌ Failed: `{failed}`"
+                        )
+
+                await asyncio.sleep(delay)
+
+        status = "completed"
+
+    except asyncio.CancelledError:
+        status = "cancelled"
+
+    except Exception as e:
+        log_exception("BROADCAST ERROR", e)
+        status = "failed"
+
+    finally:
+
+        broadcast_running = False
+        broadcast_cancel = False
+
+        elapsed = time.monotonic() - started
+
+        fire(
+            db.update_broadcast(
+                broadcast_id, sent, failed, blocked, status
+            ),
+            f"db-bc-final-{broadcast_id}",
+        )
+
+        log.info(
+            "BROADCAST %s | Total=%s | Sent=%s | Blocked=%s | Failed=%s "
+            "| Time=%.1fs",
+            status.upper(),
+            total,
+            sent,
+            blocked,
+            failed,
+            elapsed,
+        )
+
+        with suppress(Exception):
+            await status_message.edit_text(
+                f"📢 **Broadcast {status}**\n\n"
+                f"👥 Total: `{total}`\n"
+                f"✅ Sent: `{sent}`\n"
+                f"🚫 Blocked: `{blocked}`\n"
+                f"❌ Failed: `{failed}`\n"
+                f"⏱ Time: `{elapsed:.0f}s`"
+            )
+
+
+@app.on_message(filters.private & filters.command("broadcast"))
+async def broadcast_command(client, message):
+
+    global broadcast_running, broadcast_cancel
+
+    try:
+
+        if not message.from_user or message.from_user.id != OWNER_ID:
+            return
+
+        if not db.enabled:
+            await message.reply_text(
+                "💾 Database is offline — broadcast needs the user list."
+            )
+            return
+
+        if broadcast_running:
+            await message.reply_text(
+                "⚠️ A broadcast is already running.\n"
+                "Use `/cancelbroadcast` to stop it."
+            )
+            return
+
+        source = message.reply_to_message
+        text = None
+
+        if not source:
+
+            parts = message.text.split(None, 1)
+
+            if len(parts) < 2 or not parts[1].strip():
+                await message.reply_text(
+                    "📢 **Broadcast**\n\n"
+                    "Reply to any message with `/broadcast`,\n"
+                    "or send `/broadcast your text here`."
+                )
+                return
+
+            text = parts[1].strip()
+
+        broadcast_running = True
+        broadcast_cancel = False
+
+        status_message = await message.reply_text(
+            "📢 **Broadcast starting...**"
+        )
+
+        create_task(
+            broadcast_worker(source, status_message, text),
+            "broadcast",
+        )
+
+    except Exception as e:
+        broadcast_running = False
+        log_exception("/BROADCAST ERROR", e)
+
+
+@app.on_message(filters.private & filters.command("cancelbroadcast"))
+async def cancel_broadcast_command(client, message):
+
+    global broadcast_cancel
+
+    try:
+
+        if not message.from_user or message.from_user.id != OWNER_ID:
+            return
+
+        if not broadcast_running:
+            await message.reply_text("ℹ️ No broadcast is running.")
+            return
+
+        broadcast_cancel = True
+
+        await message.reply_text("🛑 Stopping the broadcast...")
+
+    except Exception as e:
+        log_exception("/CANCELBROADCAST ERROR", e)
+
+
+# ============================================================
 # TRACK CHATS THE BOT IS ADDED TO / REMOVED FROM
 # ============================================================
 
@@ -1801,6 +2118,7 @@ if __name__ == "__main__":
     print(" Background DM         : ON")
     print(" Verification          : ON")
     print(" Restart Recovery      : ON")
+    print(" Broadcast             : ON")
     print(" FloodWait Handling    : ON")
     print("=" * 70)
     print()
